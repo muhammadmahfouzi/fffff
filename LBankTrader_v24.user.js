@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LBankTrader
 // @namespace    local.bale.lbank.1bankbot
-// @version      4.0.23-lbank
+// @version      4.0.24-lbank
 // @description  پایش زنده و انجام معاملات بازارهای دلاری از جانب شما در LBank
 // @match        https://web.bale.ai/*
 // @match        https://www.lbank.com/*
@@ -26,15 +26,37 @@
   if (typeof window !== 'undefined' && window.location.hostname === 'www.lbank.com') {
     (() => {
       try {
-        const tokenRaw = window.localStorage && window.localStorage.getItem('token');
-        const tokenData = tokenRaw ? JSON.parse(tokenRaw) : {};
-        if (tokenData && tokenData.uuid) {
-          GM_setValue('lbank_web_session_token', String(tokenData.uuid));
+        let token = null;
+
+        // Primary: localStorage['token'] = JSON.stringify({uuid: "..."})
+        try {
+          const raw = window.localStorage.getItem('token');
+          if (raw) { const d = JSON.parse(raw); if (d?.uuid) token = String(d.uuid); }
+        } catch (_) {}
+
+        // Fallback: persist:root (zustand-persist) = {state:{auth:{token:"..."}}}
+        if (!token) {
+          try {
+            const raw = window.localStorage.getItem('persist:root');
+            if (raw) {
+              const d = JSON.parse(raw);
+              const t = d?.state?.auth?.token || d?.auth?.token;
+              if (t) token = String(t);
+            }
+          } catch (_) {}
+        }
+
+        if (token) {
+          GM_setValue('lbank_web_session_token', token);
+          GM_setValue('lbank_token_collected_at', String(Date.now()));
           const deviceId = window.localStorage.getItem('lb_deviceid') || '';
           if (deviceId) GM_setValue('lbank_web_device_id', deviceId);
-          // Show a brief notification so user knows it worked
           if (typeof GM_notification === 'function') {
-            GM_notification({ text: 'LBankTrader: session token collected ✓', title: 'LBankTrader', timeout: 3000 });
+            GM_notification({ text: `LBankTrader: session token collected ✓ (${token.slice(0,8)}…)`, title: 'LBankTrader', timeout: 4000 });
+          }
+        } else {
+          if (typeof GM_notification === 'function') {
+            GM_notification({ text: 'LBankTrader: ❌ token یافت نشد — لطفاً وارد LBank شوید', title: 'LBankTrader', timeout: 5000 });
           }
         }
       } catch (_) {}
@@ -47,11 +69,15 @@
    ******************************************************************/
   const API_BASE = 'https://api.lbkex.com';
 
-  // v23: LBank internal web API — used as fallback when public RSA API is blocked (10008)
+  // v23+: LBank internal web API — used as fallback when public RSA API is blocked (10008)
   // Discovered from LBank's own JS bundle (ccapi.rerrkvifj.com = prod basePath for www.lbank.com)
   const CCAPI_BASE = 'https://ccapi.rerrkvifj.com';
   // HMAC-SHA256 secret hardcoded in LBank's web app JS bundle (atob("MjNiZWM0Zjg0ODkxMDk2ZTExMjgxMmMzMmM3YzMxYjM="))
   const CCAPI_SECRET = '23bec4f84891096e112812c32c7c31b3';
+  // Fixed UA used in BOTH the HMAC signature AND the User-Agent request header.
+  // Must be identical in both places; using navigator.userAgent risks mismatch when GM_xmlhttpRequest
+  // sends a different UA than what the page context exposes.
+  const CCAPI_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
   const LBANK_CREATE_ORDER_TEST_PREFLIGHT_ENABLED = false; // create_order_test.do can reject valid public pairs with 10008; use create_order response as source of truth
   // v19: Only the documented v2 supplement endpoint is used. '/v2/create_order.do' is not an
@@ -4679,30 +4705,35 @@ async function signLbankParams(params, secretKey, signatureMethod = LBANK_SIGNAT
 function getCcapiSessionToken() {
   try { return String(GM_getValue('lbank_web_session_token', '') || '').trim(); } catch(_) { return ''; }
 }
+function getCcapiTokenAgeMs() {
+  try {
+    const t = Number(GM_getValue('lbank_token_collected_at', 0) || 0);
+    return t > 0 ? Date.now() - t : -1;
+  } catch(_) { return -1; }
+}
 function getCcapiDeviceId() {
-  try { return String(GM_getValue('lbank_web_device_id', '') || '').trim() || 'lbk-trader-bot-v23'; } catch(_) { return 'lbk-trader-bot-v23'; }
+  try { return String(GM_getValue('lbank_web_device_id', '') || '').trim(); } catch(_) { return ''; }
 }
 
 async function ccapiComputeSignature(method, path) {
-  // Matches the LBank web app's addSignatureHeader interceptor:
-  //   signPath = url.replace(/^\/lbk-api(?=\/|$)/, '')   (strip frontend prefix)
-  //   str = [method, signPath, timestamp, ua, versionCode, channel, clientType, deviceId].join('')
-  //   signature = Base64( Hex( HMAC-SHA256(str, secret) ) ) [hex treated as UTF8 then b64-encoded]
+  // Matches LBank's generateSignature / addSignatureHeader exactly:
+  //   str = [method, path, timestamp, userAgent, versionCode, channel, clientType, deviceId].join('')
+  //   signature = Base64(Utf8.parse(Hex(HMAC-SHA256(str, secret))))
+  // We use a hardcoded UA (CCAPI_UA) that MUST match the User-Agent header sent in the actual request.
   const timestamp = String(Date.now());
-  const ua = navigator.userAgent || 'Mozilla/5.0';
   const deviceId = getCcapiDeviceId();
-  const signStr = [method.toUpperCase(), path, timestamp, ua, '', '', 'WEB', deviceId].join('');
+  const signStr = [method.toUpperCase(), path, timestamp, CCAPI_UA, '', '', 'WEB', deviceId].join('');
   const hexHmac = await hmacSha256Hex(signStr, CCAPI_SECRET);
   return { signature: btoa(hexHmac), timestamp };
 }
 
-function httpRequestCcapi(path, data = null) {
+function httpRequestCcapi(path, data = null, skipTokenCheck = false) {
   return new Promise(async (resolve, reject) => {
     const token = getCcapiSessionToken();
-    if (!token) {
+    if (!token && !skipTokenCheck) {
       reject(new Error(
-        'v23: session token LBank موجود نیست. ' +
-        'برای فعال‌کردن مسیر داخلی ccapi، اسکریپت را نصب کرده و سپس یک‌بار به www.lbank.com بروید تا token به‌طور خودکار جمع‌آوری شود.'
+        'v24: session token LBank موجود نیست. ' +
+        'به www.lbank.com بروید، وارد حساب شوید — اسکریپت به‌صورت خودکار token را ذخیره می‌کند.'
       ));
       return;
     }
@@ -4716,21 +4747,28 @@ function httpRequestCcapi(path, data = null) {
       reject(new Error('ccapi signature error: ' + (e?.message || e)));
       return;
     }
+    const deviceId = getCcapiDeviceId();
     const headers = {
       'Accept': 'application/json',
+      'User-Agent': CCAPI_UA,
+      'Origin': 'https://www.lbank.com',
+      'Referer': 'https://www.lbank.com/',
+      'Accept-Language': 'en-US,en;q=0.9',
       'ex-timestamp': timestamp,
       'ex-signature': sig,
       'ex-station': '1',
-      'ex-token': token,
       'ex-client-type': 'WEB',
       'ex-client-source': 'WEB',
       'ex-browser-name': 'Chrome',
-      'ex-browser-version': '120',
+      'ex-browser-version': '124',
       'ex-os-name': 'Windows',
       'ex-os-version': '10',
       'ex-language': 'en',
-      'ex-device-id': getCcapiDeviceId(),
+      'ex-api-host': 'www.lbank.com',
+      'ex-host-name': 'www.lbank.com',
     };
+    if (deviceId) headers['ex-device-id'] = deviceId;
+    if (token) headers['ex-token'] = token;
     let body = null;
     if (data !== null) {
       headers['Content-Type'] = 'application/json';
@@ -4757,12 +4795,32 @@ function httpRequestCcapi(path, data = null) {
   });
 }
 
+// Validates the stored session token by reading balance — returns true if token is valid
+async function validateCcapiToken() {
+  try {
+    const res = await httpRequestCcapi('/spot-trade-center/asset/spot');
+    const code = res.json?.code ?? res.json?.error_code;
+    return code === 200 || code === 0;
+  } catch(_) { return false; }
+}
+
 // Place a spot order via the LBank internal ccapi
 // side: 'BUY' | 'SELL'
 // type: 'MARKET' | 'LIMIT'
 // price: required for LIMIT, omit for MARKET
 // quantity: base token qty (for LIMIT), or USDT to spend (for BUY MARKET) / base qty (for SELL MARKET)
 async function createOrderCcapi(symbol, side, type, price, quantity) {
+  // Validate token first — check its age and do a live read to confirm it's still valid
+  const ageMs = getCcapiTokenAgeMs();
+  const ageStr = ageMs >= 0 ? `${Math.round(ageMs/60000)}min` : 'نامشخص';
+  log(`[ccapi] اعتبارسنجی session token (سن: ${ageStr})...`, 'info');
+  const tokenOk = await validateCcapiToken();
+  if (!tokenOk) {
+    throw new Error(
+      `[ccapi] session token LBank منقضی یا نامعتبر است (سن: ${ageStr}). ` +
+      `لطفاً الان به www.lbank.com بروید (لاگین بودن ضروری است) و منتظر بمانید تا notification "token collected" ظاهر شود، سپس دوباره سفارش بدهید.`
+    );
+  }
   const body = {
     symbol: String(symbol).toLowerCase().replace('/', '_'),
     side: String(side).toUpperCase(),
@@ -4772,16 +4830,18 @@ async function createOrderCcapi(symbol, side, type, price, quantity) {
   if (type.toUpperCase() !== 'MARKET') {
     body.price = String(price);
   }
-  log(`[ccapi] ارسال سفارش داخلی: ${JSON.stringify(body)}`, 'info');
+  log(`[ccapi] ارسال سفارش: ${JSON.stringify(body)}`, 'info');
   const res = await httpRequestCcapi('/spot-trade-center/order/place', body);
   const json = res.json;
   const code = json?.code ?? json?.error_code;
   const msg = String(json?.message ?? json?.msg ?? res.text ?? '');
   if (code === 200 || code === 0) {
-    log(`[ccapi] سفارش موفق: ${JSON.stringify(json?.data)}`, 'info');
+    log(`[ccapi] ✅ سفارش ثبت شد: ${JSON.stringify(json?.data)}`, 'info');
     return json?.data;
   }
-  if (code === 401) throw new Error(`[ccapi] نیاز به ورود مجدد به LBank — صفحه www.lbank.com را مجدداً باز کن (${code}): ${msg}`);
+  if (code === 401 || code === 500) throw new Error(
+    `[ccapi] نیاز به ورود مجدد به LBank (${code}). به www.lbank.com بروید تا token تازه شود.`
+  );
   throw new Error(`[ccapi] خطای سفارش (${code}): ${msg}`);
 }
 
