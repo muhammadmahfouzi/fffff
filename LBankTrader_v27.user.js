@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LBankTrader
 // @namespace    local.bale.lbank.1bankbot
-// @version      4.0.26-lbank
+// @version      4.0.27-lbank
 // @description  پایش زنده و انجام معاملات بازارهای دلاری از جانب شما در LBank
 // @match        https://web.bale.ai/*
 // @match        https://www.lbank.com/*
@@ -3379,7 +3379,10 @@ async function buildManualSellCandidates(wallets, preferredQuote = 'usdt', optio
 
       const pairRules = await getLbankPairRules(base, quote, options);
       const minQty = Math.max(0, num(pairRules?.minQty));
-      const minVisibleValue = safeMinUsdtOrderValue(price, pairRules) + SELL_KEEP_MAX_USDT_VALUE;
+      // v26: don't add SELL_KEEP_MAX_USDT_VALUE to the display threshold —
+      // for manual sell the user wants to sell their whole balance, so only
+      // require that the notional value meets the exchange minimum order.
+      const minVisibleValue = safeMinUsdtOrderValue(price, pairRules);
       const quoteValue = qty * price;
       if (minQty > 0 && qty < minQty) continue;
       if (quoteValue < minVisibleValue) continue;
@@ -4000,7 +4003,7 @@ function canonicalBaseEquals(left, right) {
         const item = selected[i];
         await executeSell(item.base, item.quote, item.balance, false, item.balance, {
           accountId,
-          keepReserve: true,
+          keepReserve: false,  // v26: sell full balance on manual sell, no keep-reserve
           reasonLabel: 'manual_sell',
           allowWhenDryRunOff: true,
         });
@@ -4949,13 +4952,25 @@ async function getOrderStatusCcapi(uuid, pairCode) {
         // orderStatus: 0=pending,1=partial,2=done,3=canceled,-1=canceled
         const st = Number(found.orderStatus ?? found.status ?? found.tradeStatus ?? 2);
         const normalizedStatus = (st === -1 || st === 3) ? 'Canceled' : (st === 1 ? 'Active' : 'Done');
+        const isBuyMarket = String(found.type || found.side || '').toUpperCase().includes('BUY');
+        const execPrice = num(found.avgPrice || found.dealPrice || found.price || 0);
+        // dealAmount = base token qty received/sold; amount = for market-buy it's USDT spent
+        const dealBaseQty = num(found.dealAmount || found.dealAmt || found.executedQty || 0);
+        let matchedAmt;
+        if (dealBaseQty > 0) {
+          matchedAmt = dealBaseQty;  // prefer explicit deal quantity
+        } else if (isBuyMarket && num(found.amount || 0) > 0 && execPrice > 0) {
+          matchedAmt = num(found.amount) / execPrice;  // compute ALT = USDT / price
+        } else {
+          matchedAmt = num(found.amount || found.quantity || 0);
+        }
         return {
           id: uuid, status: normalizedStatus, statusCode: st,
-          matchedAmount: num(found.dealAmount || found.dealAmt || found.executedQty || found.amount || 0),
-          averagePrice: num(found.avgPrice || found.dealPrice || found.price || 0),
+          matchedAmount: matchedAmt,
+          averagePrice: execPrice,
           amount: num(found.amount || found.quantity || found.origQty || 0),
           quoteAmount: num(found.dealMoney || found.cummulativeQuoteQty || 0),
-          side: String(found.type || found.side || '').toLowerCase().includes('sell') ? 'sell' : 'buy',
+          side: isBuyMarket ? 'buy' : 'sell',
           raw: { data: found, _via: 'ccapi' },
         };
       }
