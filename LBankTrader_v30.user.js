@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LBankTrader
 // @namespace    local.bale.lbank.1bankbot
-// @version      4.0.29-lbank
+// @version      4.0.30-lbank
 // @description  پایش زنده و انجام معاملات بازارهای دلاری از جانب شما در LBank
 // @match        https://web.bale.ai/*
 // @match        https://www.lbank.com/*
@@ -5927,19 +5927,29 @@ async function buildTodayRealizedPnlReport() {
       const now = Date.now();
       const dayMs = 24 * 60 * 60 * 1000;
       for (const o of list) {
-        const orderTime = num(o.orderTime || o.createTime || o.time || 0);
-        if (orderTime > 0 && (now - orderTime) > dayMs * 7) continue; // skip orders >7 days old
-        const typeStr = String(o.type || o.side || '').toUpperCase();
-        const isBuy = typeStr.includes('BUY');
-        const isSell = typeStr.includes('SELL');
+        const orderTime = num(o.orderTime || o.createTime || o.updateTime || o.time || 0);
+        if (orderTime > 0 && (now - orderTime) > dayMs * 7) continue; // skip >7 days
+        // type = "limit"/"market"/"BUY_MARKET"/"SELL_MARKET"; side = "buy"/"sell"
+        // Check BOTH fields independently — limit orders have type="limit", direction in side
+        const typeStr = String(o.type || '').toUpperCase();
+        const sideStr = String(o.side || '').toUpperCase();
+        const isBuy  = typeStr.includes('BUY')  || sideStr === 'BUY';
+        const isSell = !isBuy && (typeStr.includes('SELL') || sideStr === 'SELL');
         if (!isBuy && !isSell) continue;
         const pairCode = String(o.category || o.symbol || '');
         const parts = pairCode.split('_');
         const base = (parts[0] || pairCode).toUpperCase();
         const quote = normalizeQuoteCode(parts[1] || 'usdt');
+        const isMarketBuy = isBuy && (typeStr.includes('MARKET') || typeStr === 'BUY_MARKET');
         const price = num(o.avgPrice || o.dealPrice || o.price || 0);
-        const qty = num(o.dealAmount || o.dealAmt || o.executedQty || o.amount || 0);
-        const quoteAmt = num(o.dealMoney || o.cummulativeQuoteQty || 0) || (qty * price);
+        // dealAmount = base-token qty received/sold (most reliable)
+        // For market buy: o.amount = USDT spent; convert to base if no dealAmount
+        const dealBase = num(o.dealAmount || o.dealAmt || o.executedQty || 0);
+        const recordedAmt = num(o.amount || o.quantity || 0);
+        const qty = dealBase > 0 ? dealBase
+          : (isMarketBuy && price > 0 ? recordedAmt / price : recordedAmt);
+        const quoteAmt = num(o.dealMoney || o.cummulativeQuoteQty || 0)
+          || (isMarketBuy ? recordedAmt : qty * price);
         if (!(qty > 0) && !(quoteAmt > 0)) continue;
         histRows.push({
           base,
