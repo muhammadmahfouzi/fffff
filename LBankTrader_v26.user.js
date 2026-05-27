@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LBankTrader
 // @namespace    local.bale.lbank.1bankbot
-// @version      4.0.25-lbank
+// @version      4.0.26-lbank
 // @description  پایش زنده و انجام معاملات بازارهای دلاری از جانب شما در LBank
 // @match        https://web.bale.ai/*
 // @match        https://www.lbank.com/*
@@ -4904,6 +4904,73 @@ async function getOpenOrdersCcapi(symbol) {
   throw new Error(`[ccapi] دریافت سفارشات باز خطا (${code}): ${res.json?.message ?? res.text}`);
 }
 
+// Returns true if orderId looks like a ccapi UUID (8-4-4-4-12 hex)
+function isCcapiUuid(orderId) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(orderId || ''));
+}
+
+// Get order status for a ccapi (UUID) order.
+// Strategy: check allOrdering (open), then queryHistory (closed), then assume Done.
+async function getOrderStatusCcapi(uuid, pairCode) {
+  const category = String(pairCode || '').toLowerCase().replace('/', '_');
+
+  // Step 1: Is it still open?
+  try {
+    const openRes = await httpRequestCcapi(
+      '/spot-trade-center/order/allOrdering' + (category ? `?category=${encodeURIComponent(category)}` : '')
+    );
+    const openList = openRes.json?.data?.resultList || openRes.json?.data || [];
+    if (Array.isArray(openList)) {
+      const found = openList.find(o => (o.uuid || o.orderId || o.id) === uuid);
+      if (found) {
+        const dealAmt = num(found.dealAmount || found.dealAmt || found.executedQty || 0);
+        return {
+          id: uuid, status: 'Active', statusCode: 1,
+          matchedAmount: dealAmt,
+          averagePrice: num(found.avgPrice || found.dealPrice || found.price || 0),
+          amount: num(found.amount || found.quantity || found.origQty || 0),
+          quoteAmount: num(found.dealMoney || found.cummulativeQuoteQty || 0),
+          side: String(found.type || found.side || '').toLowerCase().includes('sell') ? 'sell' : 'buy',
+          raw: { data: found, _via: 'ccapi' },
+        };
+      }
+    }
+  } catch (_) {}
+
+  // Step 2: Check history (filled or canceled)
+  try {
+    const histRes = await httpRequestCcapi(
+      '/spot-trade-center/order/queryHistory?pageNo=1&pageSize=20' + (category ? `&category=${encodeURIComponent(category)}` : '')
+    );
+    const histList = histRes.json?.data?.resultList || histRes.json?.data || [];
+    if (Array.isArray(histList)) {
+      const found = histList.find(o => (o.uuid || o.orderId || o.id) === uuid);
+      if (found) {
+        // orderStatus: 0=pending,1=partial,2=done,3=canceled,-1=canceled
+        const st = Number(found.orderStatus ?? found.status ?? found.tradeStatus ?? 2);
+        const normalizedStatus = (st === -1 || st === 3) ? 'Canceled' : (st === 1 ? 'Active' : 'Done');
+        return {
+          id: uuid, status: normalizedStatus, statusCode: st,
+          matchedAmount: num(found.dealAmount || found.dealAmt || found.executedQty || found.amount || 0),
+          averagePrice: num(found.avgPrice || found.dealPrice || found.price || 0),
+          amount: num(found.amount || found.quantity || found.origQty || 0),
+          quoteAmount: num(found.dealMoney || found.cummulativeQuoteQty || 0),
+          side: String(found.type || found.side || '').toLowerCase().includes('sell') ? 'sell' : 'buy',
+          raw: { data: found, _via: 'ccapi' },
+        };
+      }
+    }
+  } catch (_) {}
+
+  // Step 3: Not found anywhere — market orders fill instantly, assume Done
+  log(`[ccapi] سفارش ${uuid.slice(0,8)}… در لیست باز/تاریخچه نیافت — فرض می‌شود تکمیل شده (market)`, 'info');
+  return {
+    id: uuid, status: 'Done', statusCode: 2,
+    matchedAmount: 0, averagePrice: 0, amount: 0, quoteAmount: 0, side: 'buy',
+    raw: { _via: 'ccapi', _assumed: 'done' },
+  };
+}
+
 // ==========================================================================
 // End v23 Internal API
 // ==========================================================================
@@ -6267,6 +6334,13 @@ async function placeMarketOrder(side, base, quote, amount, priceHint, options = 
 async function getOrderStatus(orderId, options = {}) {
   const pending = state.pending?.[String(orderId)] || {};
   const symbol = pending.symbol || lbankSymbol(pending.base || options.base || '', pending.quote || options.quote || 'usdt');
+
+  // ccapi orders have UUID format — public API doesn't know about them
+  if (isCcapiUuid(orderId)) {
+    const pairCode = String(symbol || '').toLowerCase().replace('/', '_');
+    return getOrderStatusCcapi(String(orderId), pairCode);
+  }
+
   const payload = { symbol, orderId: String(orderId) };
   let res = null;
   let lastErr = null;
