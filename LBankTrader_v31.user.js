@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LBankTrader
 // @namespace    local.bale.lbank.1bankbot
-// @version      4.0.30-lbank
+// @version      4.0.31-lbank
 // @description  پایش زنده و انجام معاملات بازارهای دلاری از جانب شما در LBank
 // @match        https://web.bale.ai/*
 // @match        https://www.lbank.com/*
@@ -5999,49 +5999,66 @@ async function buildTodayRealizedPnlReport() {
 function renderTodayRealizedPnlReport(report) {
   const rows = Array.isArray(report?.rows) ? report.rows : [];
   const totals = report?.totals || {};
-  const fmt = t => t > 0 ? new Date(t).toLocaleTimeString('fa-IR', {hour:'2-digit', minute:'2-digit'}) : '—';
-  const statusLabel = s => s === 'open_local_position' ? '🟢 باز' : (s === 'history_buy' ? '🔵 خرید' : (s === 'history_sell' ? '🔴 فروش' : s));
+  const fmtTime = t => t > 0 ? new Date(t).toLocaleTimeString('fa-IR', {hour:'2-digit', minute:'2-digit'}) : '—';
+  const typeTag = s => {
+    if (s === 'open_local_position') return '<span style="color:#0ea37a;font-weight:700;">باز</span>';
+    if (s === 'history_buy')  return '<span style="color:#2563eb;font-weight:700;">خرید</span>';
+    if (s === 'history_sell') return '<span style="color:#dc2626;font-weight:700;">فروش</span>';
+    return escapeHtml(s);
+  };
+
+  const thStyle = 'padding:8px 6px;border-bottom:2px solid #e2e8f0;font-weight:700;white-space:nowrap;';
+  const tdStyle = 'padding:7px 6px;border-bottom:1px solid #f1f5f9;vertical-align:middle;';
+
   const htmlRows = rows.length
     ? rows.map((row, idx) => {
-        const isHistory = row.status === 'history_buy' || row.status === 'history_sell';
-        const qty = isHistory ? (row.buyQty || row.sellQty) : row.buyQty;
-        const price = isHistory ? (row.buyPrice || row.sellPrice) : row.buyPrice;
-        const quoteAmt = isHistory ? (row.buyGrossQuote || row.sellGrossQuote) : row.buyGrossQuote;
-        return `
-          <tr style="${isHistory ? 'opacity:0.85;' : ''}">
-            <td>${formatFaNumber(idx + 1)}</td>
-            <td><b>${escapeHtml(row.base)}</b></td>
-            <td>${statusLabel(row.status)}</td>
-            <td>${formatAmount(qty)}</td>
-            <td>${price > 0 ? formatPrice(price, row.quote || 'usdt') : '—'}</td>
-            <td>${quoteAmt > 0 ? formatQuoteValue(quoteAmt, row.quote || 'usdt') : (row.pnlValue !== 0 ? formatDailyPnlSignedValue(row.pnlValue, row.quote || 'usdt') : '—')}</td>
-            <td>${fmt(row.timeMs)}</td>
-          </tr>
-        `;
+        const isOpen = row.status === 'open_local_position';
+        const qty    = isOpen ? row.buyQty    : (row.buyQty    || row.sellQty);
+        const price  = isOpen ? row.buyPrice  : (row.buyPrice  || row.sellPrice);
+        const quote  = row.quote || 'usdt';
+        const value  = isOpen
+          ? (row.pnlValue !== 0 ? formatDailyPnlSignedValue(row.pnlValue, quote) : (row.buyGrossQuote > 0 ? formatQuoteValue(row.buyGrossQuote, quote) : '—'))
+          : formatQuoteValue(row.buyGrossQuote || row.sellGrossQuote, quote);
+        const bgColor = idx % 2 === 0 ? '' : 'background:#f8fafc;';
+        return `<tr style="${bgColor}">
+          <td style="${tdStyle}color:#94a3b8;">${formatFaNumber(idx + 1)}</td>
+          <td style="${tdStyle}font-weight:700;">${escapeHtml(row.base)}</td>
+          <td style="${tdStyle}">${typeTag(row.status)}</td>
+          <td style="${tdStyle}">${formatAmount(qty)}</td>
+          <td style="${tdStyle}">${price > 0 ? formatPrice(price, quote) : '—'}</td>
+          <td style="${tdStyle}font-weight:600;">${value}</td>
+          <td style="${tdStyle}color:#64748b;font-size:13px;">${fmtTime(row.timeMs)}</td>
+        </tr>`;
       }).join('')
-    : `<tr><td colspan="7" style="text-align:center;padding:16px;color:#8888aa;">سفارش یا پوزیشن فعالی یافت نشد.</td></tr>`;
+    : `<tr><td colspan="7" style="${tdStyle}text-align:center;color:#94a3b8;padding:20px;">سفارش یا پوزیشن فعالی یافت نشد.</td></tr>`;
 
-  const buyTotal = num(totals.totalBuyGross);
+  const buyTotal  = num(totals.totalBuyGross);
   const sellTotal = num(totals.totalSellGross);
-  const netPnl = sellTotal > 0 && buyTotal > 0 ? sellTotal - buyTotal : num(totals.totalPnl);
+  const netPnl    = sellTotal > 0 && buyTotal > 0 ? sellTotal - buyTotal : num(totals.totalPnl);
 
   return `
     <div class="lbk-summary">
-      <div><b>گزارش معاملات LBank</b></div>
-      <div>جمع خرید: <b>${formatQuoteValue(buyTotal, 'usdt')}</b> | جمع فروش: <b>${formatQuoteValue(sellTotal, 'usdt')}</b></div>
-      ${netPnl !== 0 ? `<div>سود/زیان خالص تقریبی: <b>${formatDailyPnlSignedValue(netPnl, 'usdt')}</b></div>` : ''}
-      <div class="lbk-note" style="display:block;font-size:12px;">${escapeHtml(report?.note || '')}</div>
+      <div style="font-weight:700;margin-bottom:4px;">گزارش معاملات LBank</div>
+      <div>جمع خرید: <b>${formatQuoteValue(buyTotal, 'usdt')}</b> &nbsp;|&nbsp; جمع فروش: <b>${formatQuoteValue(sellTotal, 'usdt')}</b></div>
+      ${netPnl !== 0 ? `<div>سود/زیان خالص تقریبی: <b style="color:${netPnl >= 0 ? '#0ea37a' : '#dc2626'}">${formatDailyPnlSignedValue(netPnl, 'usdt')}</b></div>` : ''}
     </div>
-    <div style="overflow:auto; max-height:420px;">
-      <table style="width:100%; border-collapse:collapse; direction:rtl; text-align:right; font-size:13px;">
+    <div style="overflow:auto;max-height:400px;">
+      <table style="width:100%;border-collapse:collapse;direction:rtl;text-align:right;font-size:14px;font-family:Tahoma,Arial,sans-serif;">
         <thead>
-          <tr style="border-bottom:1px solid #3a3a5c;">
-            <th>#</th><th>ارز</th><th>نوع</th><th>مقدار</th><th>قیمت</th><th>ارزش (USDT)</th><th>زمان</th>
+          <tr style="background:#f8fafc;">
+            <th style="${thStyle}width:32px;">#</th>
+            <th style="${thStyle}">ارز</th>
+            <th style="${thStyle}">نوع</th>
+            <th style="${thStyle}">مقدار</th>
+            <th style="${thStyle}">قیمت</th>
+            <th style="${thStyle}">ارزش</th>
+            <th style="${thStyle}">زمان</th>
           </tr>
         </thead>
         <tbody>${htmlRows}</tbody>
       </table>
     </div>
+    <div class="lbk-note" style="display:block;margin-top:8px;font-size:13px;">${escapeHtml(report?.note || '')}</div>
   `;
 }
 
