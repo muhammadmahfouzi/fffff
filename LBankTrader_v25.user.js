@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LBankTrader
 // @namespace    local.bale.lbank.1bankbot
-// @version      4.0.24-lbank
+// @version      4.0.25-lbank
 // @description  پایش زنده و انجام معاملات بازارهای دلاری از جانب شما در LBank
 // @match        https://web.bale.ai/*
 // @match        https://www.lbank.com/*
@@ -4795,60 +4795,97 @@ function httpRequestCcapi(path, data = null, skipTokenCheck = false) {
   });
 }
 
-// Validates the stored session token by reading balance — returns true if token is valid
+// v25: Correct field mapping reverse-engineered from queryHistory + LBank JS bundle (module 46191).
+//
+// KEY FINDINGS (from live API probing with real session token):
+//   • Pair field = 'category' (NOT 'symbol' — confirmed from queryHistory response)
+//   • Type field encodes BOTH direction and order style per rU map:
+//       limit buy  → type:'BUY'        limit sell  → type:'SELL'
+//       market buy → type:'BUY_MARKET' market sell → type:'SELL_MARKET'
+//   • NO separate 'side' field in the request body
+//   • Quantity for limit orders: 'quantity' (base tokens)
+//   • Amount for market BUY: 'amount' (USDT to spend)
+//   • Amount for market SELL: 'quantity' (base tokens)
+//   • allOrdering uses ?category=PAIR not ?symbol=PAIR
+//   • Order UUID in responses: 'uuid' field (not 'orderId')
+//   • Validation: use allOrdering?category (asset/spot returns 404)
+
+// Validates the stored session token with a lightweight read — returns true if valid
 async function validateCcapiToken() {
   try {
-    const res = await httpRequestCcapi('/spot-trade-center/asset/spot');
+    const res = await httpRequestCcapi('/spot-trade-center/order/allOrdering?category=alt_usdt');
     const code = res.json?.code ?? res.json?.error_code;
-    return code === 200 || code === 0;
+    // 200 = ok, also 20294 "Invalid asset pair" would mean wrong category but token IS valid
+    return code === 200 || code === 0 || code === 20294;
   } catch(_) { return false; }
 }
 
-// Place a spot order via the LBank internal ccapi
-// side: 'BUY' | 'SELL'
-// type: 'MARKET' | 'LIMIT'
-// price: required for LIMIT, omit for MARKET
-// quantity: base token qty (for LIMIT), or USDT to spend (for BUY MARKET) / base qty (for SELL MARKET)
-async function createOrderCcapi(symbol, side, type, price, quantity) {
-  // Validate token first — check its age and do a live read to confirm it's still valid
+// Place a spot order via the LBank internal ccapi.
+// ccapiSide: 'BUY' | 'SELL'
+// ccapiOrderType: 'LIMIT' | 'MARKET'
+// price: required for LIMIT orders, pass null for MARKET
+// quantity: base tokens for LIMIT orders; USDT to spend for BUY MARKET; base tokens for SELL MARKET
+async function createOrderCcapi(symbol, ccapiSide, ccapiOrderType, price, quantity) {
+  // Validate token before attempting order
   const ageMs = getCcapiTokenAgeMs();
-  const ageStr = ageMs >= 0 ? `${Math.round(ageMs/60000)}min` : 'نامشخص';
+  const ageStr = ageMs >= 0 ? `${Math.round(ageMs/60000)}دقیقه` : 'نامشخص';
   log(`[ccapi] اعتبارسنجی session token (سن: ${ageStr})...`, 'info');
   const tokenOk = await validateCcapiToken();
   if (!tokenOk) {
     throw new Error(
       `[ccapi] session token LBank منقضی یا نامعتبر است (سن: ${ageStr}). ` +
-      `لطفاً الان به www.lbank.com بروید (لاگین بودن ضروری است) و منتظر بمانید تا notification "token collected" ظاهر شود، سپس دوباره سفارش بدهید.`
+      `لطفاً الان به www.lbank.com بروید (لاگین بودن ضروری است) تا token تازه شود.`
     );
   }
-  const body = {
-    symbol: String(symbol).toLowerCase().replace('/', '_'),
-    side: String(side).toUpperCase(),
-    type: String(type).toUpperCase(),
-    quantity: String(quantity),
-  };
-  if (type.toUpperCase() !== 'MARKET') {
+
+  // Build type string: rU[orderStyle][side] from LBank bundle module 46191
+  // limited.BUY='BUY', limited.SELL='SELL', market.BUY='BUY_MARKET', market.SELL='SELL_MARKET'
+  const isMarket = String(ccapiOrderType).toUpperCase() === 'MARKET';
+  const isBuy = String(ccapiSide).toUpperCase() === 'BUY';
+  const typeStr = isMarket ? (isBuy ? 'BUY_MARKET' : 'SELL_MARKET') : (isBuy ? 'BUY' : 'SELL');
+
+  // 'category' = trading pair (NOT 'symbol') — confirmed from real API responses
+  const pairCode = String(symbol).toLowerCase().replace('/', '_');
+  const body = { category: pairCode, type: typeStr };
+
+  if (!isMarket) {
+    // Limit order: price + quantity (base tokens)
     body.price = String(price);
+    body.quantity = String(quantity);
+  } else if (isBuy) {
+    // Market buy: USDT amount to spend (server calculates token qty)
+    body.amount = String(quantity);
+  } else {
+    // Market sell: base token quantity
+    body.quantity = String(quantity);
   }
+
   log(`[ccapi] ارسال سفارش: ${JSON.stringify(body)}`, 'info');
   const res = await httpRequestCcapi('/spot-trade-center/order/place', body);
   const json = res.json;
   const code = json?.code ?? json?.error_code;
   const msg = String(json?.message ?? json?.msg ?? res.text ?? '');
+
   if (code === 200 || code === 0) {
-    log(`[ccapi] ✅ سفارش ثبت شد: ${JSON.stringify(json?.data)}`, 'info');
-    return json?.data;
+    const data = json?.data ?? {};
+    // Order UUID field is 'uuid' in ccapi responses
+    const orderId = String(data?.uuid || data?.orderId || data?.id || '').trim();
+    log(`[ccapi] ✅ سفارش ثبت شد! uuid=${orderId} | ${JSON.stringify(data)}`, 'info');
+    if (!orderId) throw new Error('[ccapi] uuid سفارش در پاسخ ccapi یافت نشد — سفارش ثبت شد اما ID نامشخص است');
+    return { ...data, _orderId: orderId };
   }
-  if (code === 401 || code === 500) throw new Error(
-    `[ccapi] نیاز به ورود مجدد به LBank (${code}). به www.lbank.com بروید تا token تازه شود.`
+  if (code === 500) throw new Error(
+    `[ccapi] خطای سرور (${code}) — احتمالاً token منقضی شده. دوباره به www.lbank.com بروید: ${msg}`
   );
   throw new Error(`[ccapi] خطای سفارش (${code}): ${msg}`);
 }
 
 async function cancelOrderCcapi(orderId, symbol) {
+  const pairCode = String(symbol).toLowerCase().replace('/', '_');
+  // Try uuid field first (ccapi native), fallback to orderId
   const res = await httpRequestCcapi('/spot-trade-center/order/cancel', {
-    orderId: String(orderId),
-    symbol: String(symbol).toLowerCase().replace('/', '_'),
+    uuid: String(orderId),
+    category: pairCode,
   });
   const code = res.json?.code ?? res.json?.error_code;
   if (code === 200 || code === 0) return res.json?.data;
@@ -4856,10 +4893,14 @@ async function cancelOrderCcapi(orderId, symbol) {
 }
 
 async function getOpenOrdersCcapi(symbol) {
-  const qs = symbol ? `?symbol=${encodeURIComponent(String(symbol).toLowerCase().replace('/', '_'))}` : '';
+  // category = pair field (not symbol), confirmed from live API probing
+  const qs = symbol ? `?category=${encodeURIComponent(String(symbol).toLowerCase().replace('/', '_'))}` : '';
   const res = await httpRequestCcapi('/spot-trade-center/order/allOrdering' + qs);
   const code = res.json?.code ?? res.json?.error_code;
-  if (code === 200 || code === 0) return Array.isArray(res.json?.data) ? res.json.data : (res.json?.data ? [res.json.data] : []);
+  if (code === 200 || code === 0) {
+    const list = res.json?.data?.resultList || res.json?.data;
+    return Array.isArray(list) ? list : (list ? [list] : []);
+  }
   throw new Error(`[ccapi] دریافت سفارشات باز خطا (${code}): ${res.json?.message ?? res.text}`);
 }
 
@@ -6145,32 +6186,39 @@ async function placeMarketOrder(side, base, quote, amount, priceHint, options = 
             log(`[ccapi] API عمومی با ۱۰۰۰۸ مسدود شد. مسیر داخلی ccapi با session token موجود امتحان می‌شود...`, 'info');
             try {
               const ccSide = side === 'buy' ? 'BUY' : 'SELL';
+              // qtyAcc=0 for alt_usdt — integer quantities
               const baseQty = trimZeroes(amountFloor(candidateAmount, qtyAcc).toFixed(qtyAcc));
 
-              // Try LIMIT order at ±2% from market price (fills immediately, equivalent to market)
-              const slipFactor = side === 'buy' ? 1.02 : 0.98;
-              const limitPx = trimZeroes((num(priceHint) * slipFactor).toFixed(priceAcc));
-              log(`[ccapi] LIMIT ${ccSide} ${symbol} @ ${limitPx} × ${baseQty} (±2% از قیمت بازار)`, 'info');
+              // v25: Correct ccapi order format (reverse-engineered from queryHistory + bundle):
+              //   category = pair code, type encodes both direction+style (BUY/SELL/BUY_MARKET/SELL_MARKET)
+              //   market buy  → amount = USDT to spend (not base qty)
+              //   market sell → quantity = base tokens
+              //   limit buy/sell → price + quantity = base tokens
 
+              // Try MARKET first (instant fill, no price needed)
               let ccapiOrderData = null;
-              // Try MARKET first (may or may not be supported with this format)
               try {
                 const mktQty = side === 'buy'
-                  ? trimZeroes((num(priceHint) * num(candidateAmount)).toFixed(2))  // USDT to spend
-                  : baseQty;  // base tokens to sell
+                  ? trimZeroes((num(priceHint) * num(candidateAmount)).toFixed(2))  // USDT for market BUY
+                  : baseQty;  // base tokens for market SELL
+                log(`[ccapi] MARKET ${ccSide} ${symbol} qty/amount=${mktQty}`, 'info');
                 ccapiOrderData = await createOrderCcapi(symbol, ccSide, 'MARKET', null, mktQty);
               } catch (mktErr) {
                 const mktMsg = String(mktErr?.message || '');
                 log(`[ccapi] MARKET رد شد (${mktMsg.slice(0,120)}). تلاش با LIMIT...`, 'warn');
+                // Fallback: LIMIT at ±2% from market price (fills almost immediately)
+                const slipFactor = side === 'buy' ? 1.02 : 0.98;
+                const limitPx = trimZeroes((num(priceHint) * slipFactor).toFixed(priceAcc));
+                log(`[ccapi] LIMIT ${ccSide} ${symbol} @ ${limitPx} × ${baseQty} (±2% از قیمت بازار)`, 'info');
                 ccapiOrderData = await createOrderCcapi(symbol, ccSide, 'LIMIT', limitPx, baseQty);
               }
 
-              const orderId = String(ccapiOrderData?.orderId || ccapiOrderData?.order_id || ccapiOrderData?.id || '').trim();
-              if (!orderId) throw new Error('[ccapi] orderId در پاسخ ccapi وجود نداشت');
-              log(`[ccapi] ✅ سفارش ثبت شد: orderId=${orderId}`, 'info');
+              // createOrderCcapi returns data with _orderId field
+              const orderId = String(ccapiOrderData?._orderId || '').trim();
+              if (!orderId) throw new Error('[ccapi] uuid سفارش در پاسخ وجود نداشت');
               const order = {
                 id: orderId,
-                clientOrderId: String(ccapiOrderData?.clientOrderId || ''),
+                clientOrderId: '',
                 amount: num(baseQty),
                 quoteAmount: num(priceHint) * num(candidateAmount),
                 price: num(priceHint),
