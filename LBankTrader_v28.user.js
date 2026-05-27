@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LBankTrader
 // @namespace    local.bale.lbank.1bankbot
-// @version      4.0.27-lbank
+// @version      4.0.28-lbank
 // @description  پایش زنده و انجام معاملات بازارهای دلاری از جانب شما در LBank
 // @match        https://web.bale.ai/*
 // @match        https://www.lbank.com/*
@@ -6044,7 +6044,7 @@ function buildMarketOrderPayload(side, base, quote, amount, priceHint, { supplem
       const str = trimZeroes(floored.toFixed(decimals));
       if (!str || str === '0' || seen.has(str)) continue;
       seen.add(str);
-      candidates.push({ decimals, amount: str });
+      candidates.push(floored);  // v27: push number, not {decimals,amount} object
     }
 
     return candidates;
