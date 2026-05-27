@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LBankTrader
 // @namespace    local.bale.lbank.1bankbot
-// @version      4.0.28-lbank
+// @version      4.0.29-lbank
 // @description  پایش زنده و انجام معاملات بازارهای دلاری از جانب شما در LBank
 // @match        https://web.bale.ai/*
 // @match        https://www.lbank.com/*
@@ -51,15 +51,38 @@
           GM_setValue('lbank_token_collected_at', String(Date.now()));
           const deviceId = window.localStorage.getItem('lb_deviceid') || '';
           if (deviceId) GM_setValue('lbank_web_device_id', deviceId);
-          if (typeof GM_notification === 'function') {
-            GM_notification({ text: `LBankTrader: session token collected ✓ (${token.slice(0,8)}…)`, title: 'LBankTrader', timeout: 4000 });
-          }
+          // Show in-page popup (no Android push notification)
+          showLbankTokenPopup(true, token.slice(0, 8));
         } else {
-          if (typeof GM_notification === 'function') {
-            GM_notification({ text: 'LBankTrader: ❌ token یافت نشد — لطفاً وارد LBank شوید', title: 'LBankTrader', timeout: 5000 });
-          }
+          showLbankTokenPopup(false, '');
         }
       } catch (_) {}
+
+      function showLbankTokenPopup(success, tokenPrefix) {
+        try {
+          const overlay = document.createElement('div');
+          overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.55);z-index:2147483646;display:flex;align-items:center;justify-content:center;';
+          const box = document.createElement('div');
+          box.style.cssText = 'background:#1a1a2e;color:#e8e8f0;border:1px solid #3a3a5c;border-radius:12px;padding:28px 32px;min-width:320px;max-width:440px;font-family:Tahoma,sans-serif;direction:rtl;text-align:right;box-shadow:0 8px 32px rgba(0,0,0,.6);';
+          const icon = success ? '✅' : '❌';
+          const title = success ? 'توکن session ذخیره شد' : 'توکن یافت نشد';
+          const body = success
+            ? `توکن LBankTrader با موفقیت ذخیره شد.<br/><small style="color:#8888aa;">شناسه: ${tokenPrefix}…</small><br/><small style="color:#8888aa;">اکنون می‌توانید به Bale برگردید و معامله کنید.</small>`
+            : 'توکن session در localStorage پیدا نشد.<br/><small style="color:#8888aa;">لطفاً وارد حساب LBank شوید و دوباره صفحه را باز کنید.</small>';
+          box.innerHTML = `
+            <div style="font-size:22px;margin-bottom:10px;">${icon} <b>LBankTrader</b></div>
+            <div style="font-size:16px;font-weight:700;margin-bottom:10px;">${title}</div>
+            <div style="font-size:14px;line-height:1.6;color:#c0c0d8;margin-bottom:20px;">${body}</div>
+            <button id="lbkt-close-btn" style="background:#4a4af0;color:#fff;border:none;border-radius:8px;padding:10px 28px;font-size:15px;cursor:pointer;font-family:Tahoma,sans-serif;">بستن</button>
+          `;
+          overlay.appendChild(box);
+          document.body.appendChild(overlay);
+          const close = () => { try { document.body.removeChild(overlay); } catch(_) {} };
+          box.querySelector('#lbkt-close-btn').addEventListener('click', close);
+          overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+          if (success) setTimeout(close, 8000);
+        } catch (_) {}
+      }
     })();
     return; // Do NOT run the main bot on lbank.com
   }
@@ -1733,16 +1756,6 @@
     while (ui.logEl.children.length > 140) {
       ui.logEl.removeChild(ui.logEl.lastChild);
     }
-
-    try {
-      if (typeof GM_notification === 'function' && (level === 'err' || level === 'warn')) {
-        GM_notification({
-          title: 'معامله‌گر ال‌بانک',
-          text: msg,
-          timeout: 3500
-        });
-      }
-    } catch (_) {}
 
     console[level === 'err' ? 'error' : 'log'](`[معامله‌گر ال‌بانک] ${msg}`);
   }
@@ -4792,7 +4805,7 @@ function httpRequestCcapi(path, data = null, skipTokenCheck = false) {
         }
         resolve({ json, text: res.responseText, status: res.status });
       },
-      onerror: (err) => reject(new Error('ccapi network error: ' + JSON.stringify(err))),
+      onerror: (err) => { let d=''; try{d=err?.error||err?.message||JSON.stringify(err);}catch(_){d=String(err);} reject(new Error('ccapi network error: '+d)); },
       ontimeout: () => reject(new Error('ccapi request timeout')),
     });
   });
@@ -5080,7 +5093,7 @@ function httpRequest(method, path, data = null, options = {}) {
 
         resolve(json !== null ? json : res.responseText);
       },
-      onerror: err => reject(new Error(`خطای شبکه LBank: ${err?.error || err?.message || err}`)),
+      onerror: err => { let d=''; try{d=err?.error||err?.message||JSON.stringify(err);}catch(_){d=String(err);} reject(new Error(`خطای شبکه LBank: ${d}`)); },
       ontimeout: () => reject(new Error('درخواست LBank timeout شد.')),
     });
   });
@@ -5887,8 +5900,9 @@ async function getTransactionsHistoryForRange(range, options = {}) {
 
 
 async function buildTodayRealizedPnlReport() {
+  // Step 1: open positions (local state)
   const openPositions = listOpenPositions();
-  const rows = openPositions.map(p => ({
+  const openRows = openPositions.map(p => ({
     base: p.base,
     quote: normalizeQuoteCode(p.quote || 'usdt'),
     accountId: p.accountId || 'primary',
@@ -5896,29 +5910,78 @@ async function buildTodayRealizedPnlReport() {
     buyPrice: num(p.avgEntryPrice),
     buyGrossQuote: num(p.entryCostQuote),
     buyQty: num(p.qty),
-    sellTimeMs: 0,
-    sellPrice: 0,
-    sellGrossQuote: 0,
-    sellQty: 0,
-    feeQuote: 0,
+    sellTimeMs: 0, sellPrice: 0, sellGrossQuote: 0, sellQty: 0, feeQuote: 0,
     pnlValue: num(p.lastPnlValue),
     pnlPercent: num(p.lastPnlPercent),
     timeMs: p.openedAt || p.lastBuyAt || 0,
     status: 'open_local_position',
   }));
 
+  // Step 2: recent ccapi trade history (last 30 orders)
+  const histRows = [];
+  let histNote = '';
+  try {
+    const res = await httpRequestCcapi('/spot-trade-center/order/queryHistory?pageNo=1&pageSize=30');
+    const list = res.json?.data?.resultList || res.json?.data || [];
+    if (Array.isArray(list)) {
+      const now = Date.now();
+      const dayMs = 24 * 60 * 60 * 1000;
+      for (const o of list) {
+        const orderTime = num(o.orderTime || o.createTime || o.time || 0);
+        if (orderTime > 0 && (now - orderTime) > dayMs * 7) continue; // skip orders >7 days old
+        const typeStr = String(o.type || o.side || '').toUpperCase();
+        const isBuy = typeStr.includes('BUY');
+        const isSell = typeStr.includes('SELL');
+        if (!isBuy && !isSell) continue;
+        const pairCode = String(o.category || o.symbol || '');
+        const parts = pairCode.split('_');
+        const base = (parts[0] || pairCode).toUpperCase();
+        const quote = normalizeQuoteCode(parts[1] || 'usdt');
+        const price = num(o.avgPrice || o.dealPrice || o.price || 0);
+        const qty = num(o.dealAmount || o.dealAmt || o.executedQty || o.amount || 0);
+        const quoteAmt = num(o.dealMoney || o.cummulativeQuoteQty || 0) || (qty * price);
+        if (!(qty > 0) && !(quoteAmt > 0)) continue;
+        histRows.push({
+          base,
+          quote,
+          accountId: 'primary',
+          typeStr: isBuy ? 'buy' : 'sell',
+          buyTimeMs: isBuy ? orderTime : 0,
+          buyPrice: isBuy ? price : 0,
+          buyGrossQuote: isBuy ? quoteAmt : 0,
+          buyQty: isBuy ? qty : 0,
+          sellTimeMs: isSell ? orderTime : 0,
+          sellPrice: isSell ? price : 0,
+          sellGrossQuote: isSell ? quoteAmt : 0,
+          sellQty: isSell ? qty : 0,
+          feeQuote: 0,
+          pnlValue: 0,
+          pnlPercent: 0,
+          timeMs: orderTime,
+          status: isBuy ? 'history_buy' : 'history_sell',
+          uuid: String(o.uuid || o.orderId || ''),
+        });
+      }
+    }
+  } catch (e) {
+    histNote = `(تاریخچه ccapi: ${String(e?.message || e).slice(0, 80)})`;
+  }
+
+  const rows = [...openRows, ...histRows.sort((a, b) => b.timeMs - a.timeMs)];
   return {
     ok: true,
-    source: 'local_positions_only',
+    source: histRows.length ? 'local_positions_and_ccapi_history' : 'local_positions_only',
     quote: 'mixed_usd',
     rows,
     totals: {
-      totalBuyGross: rows.reduce((sum, r) => sum + num(r.buyGrossQuote), 0),
-      totalSellGross: 0,
+      totalBuyGross: rows.reduce((s, r) => s + num(r.buyGrossQuote), 0),
+      totalSellGross: rows.reduce((s, r) => s + num(r.sellGrossQuote), 0),
       totalFees: 0,
-      totalPnl: rows.reduce((sum, r) => sum + num(r.pnlValue), 0),
+      totalPnl: rows.reduce((s, r) => s + num(r.pnlValue), 0),
     },
-    note: 'گزارش تاریخی معاملات ال‌بانک بدون انتخاب symbol عمومی قابل جمع‌آوری مطمئن نیست؛ برای جلوگیری از فراخوانی endpointهای قدیمی ال‌بانک، گزارش از پوزیشن‌های محلی فعلی ساخته می‌شود.',
+    note: histRows.length
+      ? `${histRows.length} سفارش اخیر از تاریخچه ccapi + پوزیشن‌های باز محلی. ${histNote}`
+      : `پوزیشن‌های محلی فعلی. تاریخچه ccapi موجود نبود. ${histNote}`,
   };
 }
 
@@ -5926,32 +5989,44 @@ async function buildTodayRealizedPnlReport() {
 function renderTodayRealizedPnlReport(report) {
   const rows = Array.isArray(report?.rows) ? report.rows : [];
   const totals = report?.totals || {};
+  const fmt = t => t > 0 ? new Date(t).toLocaleTimeString('fa-IR', {hour:'2-digit', minute:'2-digit'}) : '—';
+  const statusLabel = s => s === 'open_local_position' ? '🟢 باز' : (s === 'history_buy' ? '🔵 خرید' : (s === 'history_sell' ? '🔴 فروش' : s));
   const htmlRows = rows.length
-    ? rows.map((row, idx) => `
-        <tr>
-          <td>${formatFaNumber(idx + 1)}</td>
-          <td>${escapeHtml(row.base)}</td>
-          <td>${escapeHtml(accountLabel(row.accountId))}</td>
-          <td>${formatAmount(row.buyQty)}</td>
-          <td>${formatPrice(row.buyPrice, row.quote || 'usdt')}</td>
-          <td>${formatDailyPnlSignedValue(row.pnlValue, row.quote || 'usdt')}</td>
-          <td>${formatSignedPercent(row.pnlPercent)}</td>
-        </tr>
-      `).join('')
-    : `<tr><td colspan="7">پوزیشن محلی فعالی برای گزارش پیدا نشد.</td></tr>`;
+    ? rows.map((row, idx) => {
+        const isHistory = row.status === 'history_buy' || row.status === 'history_sell';
+        const qty = isHistory ? (row.buyQty || row.sellQty) : row.buyQty;
+        const price = isHistory ? (row.buyPrice || row.sellPrice) : row.buyPrice;
+        const quoteAmt = isHistory ? (row.buyGrossQuote || row.sellGrossQuote) : row.buyGrossQuote;
+        return `
+          <tr style="${isHistory ? 'opacity:0.85;' : ''}">
+            <td>${formatFaNumber(idx + 1)}</td>
+            <td><b>${escapeHtml(row.base)}</b></td>
+            <td>${statusLabel(row.status)}</td>
+            <td>${formatAmount(qty)}</td>
+            <td>${price > 0 ? formatPrice(price, row.quote || 'usdt') : '—'}</td>
+            <td>${quoteAmt > 0 ? formatQuoteValue(quoteAmt, row.quote || 'usdt') : (row.pnlValue !== 0 ? formatDailyPnlSignedValue(row.pnlValue, row.quote || 'usdt') : '—')}</td>
+            <td>${fmt(row.timeMs)}</td>
+          </tr>
+        `;
+      }).join('')
+    : `<tr><td colspan="7" style="text-align:center;padding:16px;color:#8888aa;">سفارش یا پوزیشن فعالی یافت نشد.</td></tr>`;
+
+  const buyTotal = num(totals.totalBuyGross);
+  const sellTotal = num(totals.totalSellGross);
+  const netPnl = sellTotal > 0 && buyTotal > 0 ? sellTotal - buyTotal : num(totals.totalPnl);
 
   return `
     <div class="lbk-summary">
-      <div><b>گزارش سود/زیان LBank</b></div>
-      <div>منبع: پوزیشن‌های محلی فعلی</div>
-      <div>جمع تقریبی سود/زیان: <b>${formatDailyPnlSignedValue(totals.totalPnl, 'usdt')}</b></div>
-      <div class="lbk-note" style="display:block;">${escapeHtml(report?.note || '')}</div>
+      <div><b>گزارش معاملات LBank</b></div>
+      <div>جمع خرید: <b>${formatQuoteValue(buyTotal, 'usdt')}</b> | جمع فروش: <b>${formatQuoteValue(sellTotal, 'usdt')}</b></div>
+      ${netPnl !== 0 ? `<div>سود/زیان خالص تقریبی: <b>${formatDailyPnlSignedValue(netPnl, 'usdt')}</b></div>` : ''}
+      <div class="lbk-note" style="display:block;font-size:12px;">${escapeHtml(report?.note || '')}</div>
     </div>
     <div style="overflow:auto; max-height:420px;">
-      <table style="width:100%; border-collapse:collapse; direction:rtl; text-align:right; font-size:14px;">
+      <table style="width:100%; border-collapse:collapse; direction:rtl; text-align:right; font-size:13px;">
         <thead>
-          <tr>
-            <th>#</th><th>ارز</th><th>حساب</th><th>مقدار</th><th>میانگین ورود</th><th>PnL</th><th>درصد</th>
+          <tr style="border-bottom:1px solid #3a3a5c;">
+            <th>#</th><th>ارز</th><th>نوع</th><th>مقدار</th><th>قیمت</th><th>ارزش (USDT)</th><th>زمان</th>
           </tr>
         </thead>
         <tbody>${htmlRows}</tbody>
