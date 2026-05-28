@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+bot_stdout.log
+bot_crash.log
+watchdog.log
+bot.pid
+log.txt
+log_1m.txt
+strategy_state.json
+strategy_local_chat_store.json
+event_message_sent.json
+pump_bale_today_sent.json
+pumping_event_sent.json
+pumpbox_no_buy_2h_pma_gf_gate.json
+monthly_realized_pnl.json
+bale_subscribers.json
+.env
